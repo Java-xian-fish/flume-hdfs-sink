@@ -25,7 +25,6 @@ import org.apache.flume.Context;
 import org.apache.flume.Event;
 import org.apache.flume.SystemClock;
 import org.apache.flume.auth.PrivilegedExecutor;
-import org.apache.flume.formatter.output.BucketPath;
 import org.apache.flume.instrumentation.SinkCounter;
 import org.apache.flume.sink.hdfs.HDFSEventSink.WriterCallback;
 import org.apache.hadoop.conf.Configuration;
@@ -66,7 +65,6 @@ class BucketWriter {
 
   private static final Logger LOG = LoggerFactory
       .getLogger(BucketWriter.class);
-
   /**
    * This lock ensures that only one thread can open a file at a time.
    */
@@ -81,14 +79,10 @@ class BucketWriter {
   private final CompressionType compType;
   private final ScheduledExecutorService timedRollerPool;
   private final PrivilegedExecutor proxyUser;
-
   private final AtomicLong fileExtensionCounter;
-
   private long eventCounter;
   private long processSize;
-
   private FileSystem fileSystem;
-
   private volatile String filePath;
   private volatile String fileName;
   private volatile String inUsePrefix;
@@ -109,12 +103,9 @@ class BucketWriter {
   private final long callTimeout;
   private final ExecutorService callTimeoutPool;
   private final int maxConsecUnderReplRotations = 30; // make this config'able?
-
   private boolean mockFsInjected = false;
-
   private final long retryInterval;
   private final int maxRetries;
-
   // flag that the bucket writer was closed due to idling and thus shouldn't be
   // reopened. Not ideal, but avoids internals of owners
   protected AtomicBoolean closed = new AtomicBoolean();
@@ -215,6 +206,14 @@ class BucketWriter {
     this.shiftDate = _s;
   }
 
+  public String getOnCloseCallbackPath(){
+    return this.onCloseCallbackPath;
+  }
+
+  public String getBucketPath() {
+    return this.bucketPath;
+  }
+
   /**
    * open() is called by append()
    * @throws IOException
@@ -258,7 +257,7 @@ class BucketWriter {
               + fullFileName + inUseSuffix;
       targetPath = filePath + "/" + _day + "/" + fullFileName;
 
-      LOG.info("Creating " + bucketPath);
+      LOG.info("jiang-->Creating " + bucketPath);
       callWithTimeout(new CallRunner<Void>() {
         @Override
         public Void call() throws Exception {
@@ -276,9 +275,9 @@ class BucketWriter {
             if (!mockFsInjected) {
               fileSystem = new Path(bucketPath).getFileSystem(config);
             }
-            LOG.info("opening " + bucketPath);
+            LOG.info("jiang-->opening " + bucketPath);
             writer.open(bucketPath, codeC, compType);
-            LOG.info("opened " + bucketPath);
+            LOG.info("jiang-->opened " + bucketPath);
           }
           return null;
         }
@@ -581,13 +580,13 @@ class BucketWriter {
     // force a new bucket writer to be created. Roll count and roll size will
     // just reuse this one
     if (!isOpen) {
-      LOG.info("bucketWriter-->append()-->572---->open");
+      LOG.info("jiang-->bucketWriter-->append()-->572---->open");
       if (closed.get()) {
         throw new BucketClosedException("This bucket writer was closed and " +
           "this handle is thus no longer valid");
       }
       open();
-      LOG.info("bucketWriter-->append()-->578---->endOpen");
+      LOG.info("jiang-->bucketWriter-->append()-->578---->endOpen");
     }
     // check if it's time to rotate the file
     if (shouldRotate()) {
@@ -612,7 +611,11 @@ class BucketWriter {
 
       if (doRotate) {
         close();
-        open();
+        if (!shiftDate) {
+          open();
+        }else {
+          onCloseCallback.run(onCloseCallbackPath);
+        }
       }
     }
     // write the event

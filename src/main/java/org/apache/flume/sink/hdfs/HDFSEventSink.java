@@ -47,7 +47,6 @@ import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.CompressionCodecFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
@@ -72,7 +71,6 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
   private static final long defaultRetryInterval = 180;
   // Retry forever.
   private static final int defaultTryCount = Integer.MAX_VALUE;
-  private long count = 0;
   public static final String IN_USE_SUFFIX_PARAM_NAME = "hdfs.inUseSuffix";
   /**
    * Default length of time we wait for blocking BucketWriter calls
@@ -125,41 +123,69 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
   private PrivilegedExecutor privExecutor;
   private static final int THREAD_SIZE = 20;
   private volatile String day;
-  private parallelSink[] parallelSinks = new parallelSink[THREAD_SIZE];
-  private Thread[] threads = new Thread[THREAD_SIZE];
-  private parallelSink[] shiftSinks = new parallelSink[2];
-  private Thread[] shiftThreads = new Thread[2];
+  private volatile parallelSink[] parallelSinks = new parallelSink[THREAD_SIZE];
+  private volatile Thread[] threads = new Thread[THREAD_SIZE];
+  private volatile parallelSink[] shiftSinks = new parallelSink[2];
+  private volatile Thread[] shiftThreads = new Thread[3];
+  private volatile ShiftController controller;
   private int ratioCount = 0;
   private int ratioSumCount = 0;
-  private double ratio = 1.0;
-  private static final int SUM_NUM = 20000;
-  private static final double BEGIN_RATIO = 0.005;
-  private static final double FIRST_RATIO = 0.75;
-  private static final double SECOND_RATIO = 0.5;
-  private static final double LAST_RATIO = 0.25;
+  private volatile double ratio = 1.0;
+  private static final int SUM_NUM = 200000;
+  private static final double FIRST_RATIO = 0.65;
+  private static final double SECOND_RATIO = 0.4;
+  private static final double LAST_RATIO = 0.1;
   private static final double END_RATIO = 0.005;
+  private static volatile int step = 1;
   private volatile boolean nextDay = false;
-  private volatile static LinkedList<Event[]> normal = new LinkedList<>();
-  private volatile static LinkedList<BucketWriter> normalBucket = new LinkedList<>();
+  volatile static LinkedList<Event[]> normal = new LinkedList<>();
+  volatile static LinkedList<BucketWriter> normalBucket = new LinkedList<>();
   /*
    * Extended Java LinkedHashMap for open file handle LRU queue.
    * We want to clear the oldest file handle if there are too many open ones.
    */
 
+  public boolean getNextDay(){
+    return this.nextDay;
+  }
+
+  public parallelSink[] getShiftSink(){
+    return shiftSinks;
+  }
+
+  public void setCurrentDay(){
+    this.ratio = 1.0;
+    this.step = 1;
+    this.ratioCount = 0;
+    this.ratioSumCount = 0;
+  }
+
   public void setNextDay(boolean _nextDay){
+    LOG.info("jiang-->setNextDay");
+    shiftSinks[0].shiftDate = true;
+    shiftSinks[1].shiftDate = true;
     shiftThreads[0] = new Thread(shiftSinks[0]);
     shiftThreads[0].start();
     shiftThreads[1] = new Thread(shiftSinks[1]);
     shiftThreads[1].start();
-    this.nextDay = _nextDay;
-    for (int i=0;i<5;i++){
-      parallelSinks[i].shifting = false;
+    Date now = new Date();
+    while (now.getHours()==23){
+      try {
+        Thread.sleep(1000);
+      }catch (Exception e){
+        e.printStackTrace();
+      }
+      now = new Date();
     }
-    for (int i=5;i<THREAD_SIZE;i++){
+    day = "" + now.getDate();
+    this.nextDay = _nextDay;
+    for (int i=0;i<THREAD_SIZE;i++){
       parallelSinks[i].shiftDate = true;
     }
-    shiftSinks[0].shiftDate = true;
-    shiftSinks[1].shiftDate = true;
+    for (int i=0;i<5;i++){
+      parallelSinks[i].shifting = true;
+    }
+    LOG.info("jiang--> end setNextDay");
   }
 
   private static class WriterLinkedHashMap
@@ -373,8 +399,8 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
   public boolean checkIfShift(Event event){
     try {
       String data = new String(event.getBody(), 0, event.getBody().length);
-      String date = data.split("\\|")[5].substring(0, 10).replace("-", "");
-      if (!date.equals(day)) {
+      String da = data.substring(data.indexOf('-')+4).substring(0,2);
+      if (!da.equals(day)) {
         return true;
       }
     }catch (Exception e){
@@ -391,20 +417,21 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
    * This method is not thread safe.
    */
   public Status process() throws EventDeliveryException {
-    //LOG.info("HDFSEventSink---->process()");
+    //LOG.info("jiang-->HDFSEventSink---->process()");
+    int batchCount = 0;
     Channel channel = getChannel();
     Transaction transaction = channel.getTransaction();
     transaction.begin();
     try {
       int txnEventCount = 0,c = 0,ii = 0;
-      for (txnEventCount = 0; txnEventCount < batchSize; txnEventCount++){
+      for (txnEventCount = 0; txnEventCount < batchSize; txnEventCount++) {
         Event event;
         event = channel.take();
         if (event == null) {
           break;
         }
-        if (!nextDay){
-          while(parallelSinks[c % THREAD_SIZE].size() >= 2000 || ii > 2000){
+        if (!nextDay) {
+          while(parallelSinks[c % THREAD_SIZE].size() >= 2000 || ii > 2000) {
             c++;
             if(c > Integer.MAX_VALUE - 60000){
               c = c - 300000000;
@@ -412,33 +439,40 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
             ii=0;
           }
           parallelSinks[c % THREAD_SIZE].add(event);
+          batchCount++;
           ii++;
         }else{
           boolean checkResult = checkIfShift(event);
           ratioSumCount++;
           //只启动shift线程处理今天数据
-          if(ratio > FIRST_RATIO){
-            if(checkResult){
-              if(c % (THREAD_SIZE - 5 +2) >= (THREAD_SIZE -5)){
-                if (shiftSinks[0].size() - shiftSinks[1].size() > 50){
-                  shiftSinks[1].add(event);
-                }else{
-                  shiftSinks[0].add(event);
-                }
-              }else{
-                while(parallelSinks[(c % (THREAD_SIZE -5 )) + 5].size() >= 2000 || ii > 2000){
+          if(step == 1) {
+            if(checkResult) {
+              if(c % (THREAD_SIZE - 5 +2) >= (THREAD_SIZE -5)) {
+                while(shiftSinks[c % 2].size() >= 2000 || ii > 2000) {
                   c++;
                   if(c > Integer.MAX_VALUE - 60000){
                     c = c - 300000000;
                   }
                   ii=0;
                 }
+                ii++;
+                shiftSinks[c % 2].add(event);
+                batchCount++;
+              } else {
+                while(parallelSinks[(c % (THREAD_SIZE -5 )) + 5].size() >= 2000 || ii > 2000) {
+                  c++;
+                  if(c > Integer.MAX_VALUE - 60000) {
+                    c = c - 300000000;
+                  }
+                  ii=0;
+                }
                 parallelSinks[(c % (THREAD_SIZE - 5)) + 5].add(event);
+                batchCount++;
                 ii++;
               }
               ratioCount++;
             }else{
-              while(parallelSinks[c % 5].size() >= 2000 || ii > 2000){
+              while(parallelSinks[c % 5].size() >= 2000 || ii > 2000) {
                 c++;
                 if(c > Integer.MAX_VALUE - 60000){
                   c = c - 300000000;
@@ -446,17 +480,62 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 ii=0;
               }
               parallelSinks[c % 5].add(event);
+              batchCount++;
               ii++;
             }
           //交换shift线程和20线程交换身份
-          }else if(ratio > SECOND_RATIO){
+          }else if(step == 2) {
+            if(checkResult){
+              if(c % (THREAD_SIZE - 10 +2) >= (THREAD_SIZE -10)){
+                while(shiftSinks[c % 2].size() >= 2000 || ii > 2000){
+                  c++;
+                  if(c > Integer.MAX_VALUE - 60000){
+                    c = c - 300000000;
+                  }
+                  ii=0;
+                }
+                ii++;
+                shiftSinks[c % 2].add(event);
+                batchCount++;
+              }else{
+                while(parallelSinks[(c % (THREAD_SIZE -10 )) + 10].size() >= 2000 || ii > 2000){
+                  c++;
+                  if(c > Integer.MAX_VALUE - 60000){
+                    c = c - 300000000;
+                  }
+                  ii=0;
+                }
+                parallelSinks[(c % (THREAD_SIZE - 10)) + 10].add(event);
+                batchCount++;
+                ii++;
+              }
+              ratioCount++;
+            }else{
+              while(parallelSinks[c % 10].size() >= 2000 || ii > 2000){
+                c++;
+                if(c > Integer.MAX_VALUE - 60000){
+                  c = c - 300000000;
+                }
+                ii=0;
+              }
+              parallelSinks[c % 10].add(event);
+              batchCount++;
+              ii++;
+            }
+          //十个线程处理今天的数据
+          }else if(step == 3) {
             if(checkResult){
               if(c % (THREAD_SIZE - 15 +2) >= (THREAD_SIZE -15)){
-                if (shiftSinks[0].size() - shiftSinks[1].size() > 50){
-                  shiftSinks[1].add(event);
-                }else{
-                  shiftSinks[0].add(event);
+                while(shiftSinks[c % 2].size() >= 2000 || ii > 2000){
+                  c++;
+                  if(c > Integer.MAX_VALUE - 60000){
+                    c = c - 300000000;
+                  }
+                  ii=0;
                 }
+                ii++;
+                shiftSinks[c % 2].add(event);
+                batchCount++;
               }else{
                 while(parallelSinks[(c % (THREAD_SIZE -15 )) + 15].size() >= 2000 || ii > 2000){
                   c++;
@@ -466,6 +545,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                   ii=0;
                 }
                 parallelSinks[(c % (THREAD_SIZE - 15)) + 15].add(event);
+                batchCount++;
                 ii++;
               }
               ratioCount++;
@@ -478,48 +558,19 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 ii=0;
               }
               parallelSinks[c % 15].add(event);
-              ii++;
-            }
-          //十个线程处理今天的数据
-          }else if(ratio > LAST_RATIO){
-            if(checkResult){
-              if(c % (THREAD_SIZE - 25 +2) >= (THREAD_SIZE -25)){
-                if (shiftSinks[0].size() - shiftSinks[1].size() > 50){
-                  shiftSinks[1].add(event);
-                }else{
-                  shiftSinks[0].add(event);
-                }
-              }else{
-                while(parallelSinks[(c % (THREAD_SIZE -25 )) + 25].size() >= 2000 || ii > 2000){
-                  c++;
-                  if(c > Integer.MAX_VALUE - 60000){
-                    c = c - 300000000;
-                  }
-                  ii=0;
-                }
-                parallelSinks[(c % (THREAD_SIZE - 25)) + 25].add(event);
-                ii++;
-              }
-              ratioCount++;
-            }else{
-              while(parallelSinks[c % 25].size() >= 2000 || ii > 2000){
-                c++;
-                if(c > Integer.MAX_VALUE - 60000){
-                  c = c - 300000000;
-                }
-                ii=0;
-              }
-              parallelSinks[c % 25].add(event);
+              batchCount++;
               ii++;
             }
           //二十个线程处理当天的数据，shift线程处理漂移数据
-          }else if(ratio > BEGIN_RATIO){
+          }else if(step == 4){
             if (checkResult) {
-              if (shiftSinks[0].size() - shiftSinks[1].size() > 50){
+              if (shiftSinks[1].size()<2000){
                 shiftSinks[1].add(event);
-              }else{
+              }else if(shiftSinks[0].size()<2000){
                 shiftSinks[0].add(event);
               }
+              c++;
+              batchCount++;
               ratioCount++;
             } else {
               while(parallelSinks[c % THREAD_SIZE].size() >= 2000 || ii > 2000){
@@ -530,48 +581,59 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 ii=0;
               }
               parallelSinks[c % THREAD_SIZE].add(event);
+              batchCount++;
               ii++;
             }
           }else{
             nextDay = false;
           }
-          ratioSumCount++;
           if (ratioSumCount==SUM_NUM){
             double _ratio = ratioCount / (double) ratioSumCount;
-            if (ratio>FIRST_RATIO&&_ratio<FIRST_RATIO){
+            if (ratio>FIRST_RATIO&&_ratio<FIRST_RATIO&&step==1) {
               if (parallelSinks[5].shiftDate){
-                for (int i=5;i<15;i++){
+                for (int i=5;i<10;i++){
                   parallelSinks[i].shifting = true;
                 }
+                LOG.info("jiang-->process FIRST_RATIO is over the 5-9 thread shift is starting!-->ratio is-->"
+                        + ratio + "**_ratio is-->" + _ratio);
+                ratio = _ratio >SECOND_RATIO ? _ratio : 0.6;
+                step = 2;
               }
-            }else if (ratio>SECOND_RATIO&&_ratio<SECOND_RATIO){
-              if (parallelSinks[15].shiftDate){
-                for (int i=15;i<25;i++){
+            }else if (ratio>SECOND_RATIO&&_ratio<SECOND_RATIO&&step==2) {
+              if (parallelSinks[10].shiftDate){
+                for (int i=10;i<15;i++){
                   parallelSinks[i].shifting = true;
                 }
+                LOG.info("jiang-->process SECOND_RATIO is over the 10-14 thread shift is starting!-->ratio is-->"
+                        + ratio + "**_ratio is-->" + _ratio);
+                ratio = _ratio > LAST_RATIO ? _ratio : 0.3;
+                step = 3;
               }
-            }else if (ratio>LAST_RATIO&& _ratio<LAST_RATIO){
-              if (parallelSinks[25].shiftDate){
-                for (int i=25;i<30;i++){
+            }else if (ratio>LAST_RATIO&& _ratio<LAST_RATIO&&step==3) {
+              if (parallelSinks[15].shiftDate) {
+                for (int i=15;i<20;i++){
                   parallelSinks[i].shifting = true;
                 }
+                LOG.info("jiang-->process SECOND_RATIO is over the 10-14 thread shift is starting!-->ratio is-->"
+                        + ratio + "**_ratio is-->" + _ratio);
+                ratio = _ratio > END_RATIO ? _ratio : 0.09;
+                step = 4;
               }
-            }else if (ratio>END_RATIO&&_ratio<END_RATIO){
+            }else if (ratio>END_RATIO&&_ratio<END_RATIO&&step==4) {
               nextDay = false;
-
-              shiftSinks[0].closed = true;
-              shiftSinks[1].closed = true;
-            }else{
-
+              LOG.info("jiang-->process SECOND_RATIO is over the 15-19 thread shift is starting!-->ratio is-->"
+                      + ratio + "**_ratio is-->" + _ratio);
+              step = 5;
+            }else {
+              ratio = _ratio;
             }
             ratioCount = 0;
             ratioSumCount = 0;
-            ratio = _ratio;
           }
         }
       }
       transaction.commit();
-
+      controller.add(batchCount);
       if ( txnEventCount < 1 ) {
         return Status.BACKOFF;
       } else {
@@ -599,11 +661,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
 
   @VisibleForTesting
   BucketWriter initializeBucketWriter(String realPath,
-      String realName, String lookupPath, HDFSWriter hdfsWriter,
-      WriterCallback closeCallback,int id) {
-    if (!threads[(id+1)%20].isAlive()){
-      threads[(id+1)%20].start();
-    }
+      String realName, String lookupPath, HDFSWriter hdfsWriter, WriterCallback closeCallback,int id) {
     HDFSWriter actualHdfsWriter = mockFs == null ? hdfsWriter : mockWriter;
     BucketWriter bucketWriter = new BucketWriter(rollInterval,
         rollSize, rollCount,
@@ -636,9 +694,12 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
         }
       }
     }
-    for(int i=0;i<20;i++){
+    for(int i=0;i<THREAD_SIZE;i++){
       parallelSinks[i].close();
     }
+    shiftSinks[0].close();
+    shiftSinks[1].close();
+    controller.close();
     // shut down all our thread pools
     ExecutorService[] toShutdown = { callTimeoutPool, timedRollerPool };
     for (ExecutorService execService : toShutdown) {
@@ -666,7 +727,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
 
   @Override
   public void start() {
-    LOG.info("HDFSEventSink---->start()");
+    LOG.info("jiang-->HDFSEventSink---->start()");
     String timeoutName = "hdfs-" + getName() + "-call-runner-%d";
     callTimeoutPool = Executors.newFixedThreadPool(threadsPoolSize,
             new ThreadFactoryBuilder().setNameFormat(timeoutName).build());
@@ -677,43 +738,19 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
 
     this.sfWriters = new WriterLinkedHashMap(maxOpenFiles);
     sinkCounter.start();
-    parallelSinks[0] = new parallelSink(0);
-    parallelSinks[1] = new parallelSink(1);
-    parallelSinks[2] = new parallelSink(2);
-    parallelSinks[3] = new parallelSink(3);
-    parallelSinks[4] = new parallelSink(4);
-    parallelSinks[5] = new parallelSink(5);
-    parallelSinks[6] = new parallelSink(6);
-    parallelSinks[7] = new parallelSink(7);
-    parallelSinks[8] = new parallelSink(8);
-    parallelSinks[9] = new parallelSink(9);
-    parallelSinks[10] = new parallelSink(10);
-    parallelSinks[11] = new parallelSink(11);
-    parallelSinks[12] = new parallelSink(12);
-    parallelSinks[13] = new parallelSink(13);
-    parallelSinks[14] = new parallelSink(14);
-    parallelSinks[15] = new parallelSink(15);
-    parallelSinks[16] = new parallelSink(16);
-    parallelSinks[17] = new parallelSink(17);
-    parallelSinks[18] = new parallelSink(18);
-    parallelSinks[19] = new parallelSink(19);
+    for (int i=0;i<THREAD_SIZE;i++){
+      parallelSinks[i] = new parallelSink(i);
+    }
     shiftSinks[0] = new parallelSink(20);
     shiftSinks[1] = new parallelSink(21);
-//    parallelSinks[20] = new parallelSink(20);
-//    parallelSinks[21] = new parallelSink(21);
-//    parallelSinks[22] = new parallelSink(22);
-//    parallelSinks[23] = new parallelSink(23);
-//    parallelSinks[24] = new parallelSink(24);
-//    parallelSinks[25] = new parallelSink(25);
-//    parallelSinks[26] = new parallelSink(26);
-//    parallelSinks[27] = new parallelSink(27);
-//    parallelSinks[28] = new parallelSink(28);
-//    parallelSinks[29] = new parallelSink(29);
-    for(int i=0;i<20;i++){
+    for(int i=0;i<THREAD_SIZE;i++){
       threads [i] = new Thread(parallelSinks[i]);
       threads[i].start();
       LOG.info("thread" + i+ "   is started");
     }
+    this.controller = new ShiftController(this);
+    shiftThreads[2] = new Thread(controller);
+    shiftThreads[2].start();
     super.start();
   }
 
@@ -733,6 +770,10 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
     this.mockFs = mockFs;
   }
 
+  public double getRatio(){
+    return this.ratio;
+  }
+
   @VisibleForTesting
   void setMockWriter(HDFSWriter writer) {
     this.mockWriter = writer;
@@ -748,27 +789,27 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
     return batchSize;
   }
 
-  private class parallelSink implements Runnable {
+  public parallelSink[] getParallelSink(){
+    return parallelSinks;
+  }
+
+
+   class parallelSink implements Runnable {
 
     private final int DATA_SIZE = 2048;
     private volatile Event[] data = new Event[DATA_SIZE];
     private volatile int rear = 0;
     private volatile int front = 0;
-    public boolean closed = false;
+    public volatile boolean closed = false;
     private volatile long count = 0;
     private int id;
     //标记日期应该是今天还是昨天 false：今天。true：昨天
     private volatile boolean shiftDate = false;
     private volatile boolean shifting = false;
-    //标记文件日期切换成功了 false：没有切换。true：切换成功。
-    private volatile boolean shifted = false;
+    private boolean updateShiftDate = false;
 
     public boolean isShiftDate() {
       return shiftDate;
-    }
-
-    public void setShiftDate(boolean shiftDate) {
-      this.shiftDate = shiftDate;
     }
 
     public parallelSink(int _id){
@@ -791,7 +832,6 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
     }
 
     public long printCount(){
-      LOG.info("Thread" + this.id + "---->count---->" + count);
       return count;
     }
 
@@ -805,9 +845,10 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
     @Override
     public void run() {
       int wrong = 0;
+      Set<BucketWriter> writers = null;
       while ( !closed ) {
         try {
-          Set<BucketWriter> writers = new LinkedHashSet<>();
+          writers = new LinkedHashSet<>();
           int txnEventCount = 0;
           while ( txnEventCount < batchSize ) {
             // reconstruct the path name by substituting place holders
@@ -832,6 +873,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
             if (shifting){
               synchronized (normal) {
                 resetData();
+                bucketWriter.setShiftDate(true);
                 normalBucket.offer(bucketWriter);
                 bucketWriter = null;
                 rear = 0;
@@ -839,19 +881,34 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 shiftDate = false;
               }
               shifting = false;
+              updateShiftDate = false;
+              LOG.info("jiang-->run thread-->" + id + "**has shifted !" );
             }
             if (shiftDate){
-              if (bucketWriter == null){
+              if (!updateShiftDate){
+                if (bucketWriter != null) {
+                  bucketWriter.setShiftDate(shiftDate);
+                  //closeCallback.run(lookupPath);
+                  //bucketWriter.close();
+                  //bucketWriter = null;
+                }
+                updateShiftDate = true;
+              }
+              if (bucketWriter == null) {
                 if (!normalBucket.isEmpty()){
                   synchronized (normal) {
                     bucketWriter = normalBucket.poll();
+                    sfWriters.put(lookupPath, bucketWriter);
+                    bucketWriter.setShiftDate(shiftDate);
                   }
+                  LOG.info("jiang-->run thread-->" + id + "**has handle old bucketWriter!" + bucketWriter.getBucketPath());
                 }
               }
             }
             // we haven't seen this file yet, so open it and cache the handle
             if (bucketWriter == null) {
               hdfsWriter = writerFactory.getWriter(fileType);
+              LOG.info("jiang--> hdfsWriter-->" + (hdfsWriter==null) + fileType);
               bucketWriter = initializeBucketWriter(realPath, realName, lookupPath, hdfsWriter, closeCallback, id);
               bucketWriter.setShiftDate(shiftDate);
               sfWriters.put(lookupPath, bucketWriter);
@@ -882,6 +939,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
               hdfsWriter = writerFactory.getWriter(fileType);
               bucketWriter = initializeBucketWriter(realPath, realName,
                       lookupPath, hdfsWriter, closeCallback, id);
+              bucketWriter.setShiftDate(shiftDate);
               synchronized (sfWritersLock) {
                 sfWriters.put(lookupPath, bucketWriter);
               }
@@ -889,10 +947,12 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
               count++;
               txnEventCount++;
             } catch (IOException ee) {
-              LOG.info("Thread" + this.id + "parallelSink-->run()-->618" + ee.getLocalizedMessage());
+              LOG.info("jiang-->Thread" + this.id + "parallelSink-->run()-->618" + ee);
+              BucketWriter _bucketWriter = sfWriters.get(lookupPath);
               wrong++;
-              if ( wrong > 10 ) {
+              if ( wrong > 10 || _bucketWriter == null) {
                 bucketWriter.close();
+                bucketWriter = null;
               }
             }
             // track the buckets getting written in this transaction
@@ -913,11 +973,19 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
             bucketWriter.flush();
           }
         } catch (InterruptedException e) {
-          LOG.info("Thread" + this.id + " parallelSink-->run()-->639"+e.getLocalizedMessage());
+          LOG.info("jiang-->Thread" + this.id + " parallelSink-->run()-->639"+e);
         } catch (IOException e) {
-          LOG.info("Thread" + this.id + " parallelSink-->run()-->641"+e.getLocalizedMessage());
+          LOG.info("jiang-->Thread" + this.id + " parallelSink-->run()-->641"+e);
         }catch (Exception e){
-          LOG.info("Thread" + this.id + " parallelSink-->run()-->643"+e.getLocalizedMessage());
+          LOG.info("jiang-->Thread" + this.id + " parallelSink-->run()-->643"+e);
+          e.printStackTrace();
+        }
+      }
+      for(String bw:sfWriters.keySet()){
+        try {
+          sfWriters.get(bw).close();
+        }catch (Exception e){
+          LOG.error("jiang-->parallelSink close BucketWriter error " + e);
         }
       }
     }
