@@ -140,6 +140,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
   private volatile boolean nextDay = false;
   volatile static LinkedList<Event[]> normal = new LinkedList<>();
   volatile static LinkedList<BucketWriter> normalBucket = new LinkedList<>();
+  private int makeSure = 0;
   /*
    * Extended Java LinkedHashMap for open file handle LRU queue.
    * We want to clear the oldest file handle if there are too many open ones.
@@ -158,6 +159,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
     this.step = 1;
     this.ratioCount = 0;
     this.ratioSumCount = 0;
+    makeSure = 0;
   }
 
   public void setNextDay(boolean _nextDay){
@@ -614,18 +616,23 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 for (int i=15;i<20;i++){
                   parallelSinks[i].shifting = true;
                 }
-                LOG.info("jiang-->process SECOND_RATIO is over the 10-14 thread shift is starting!-->ratio is-->"
+                LOG.info("jiang-->process LAST_RATIO is over the 15-19 thread shift is starting!-->ratio is-->"
                         + ratio + "**_ratio is-->" + _ratio);
                 ratio = _ratio > END_RATIO ? _ratio : 0.09;
                 step = 4;
               }
             }else if (ratio>END_RATIO&&_ratio<END_RATIO&&step==4) {
-              nextDay = false;
-              LOG.info("jiang-->process SECOND_RATIO is over the 15-19 thread shift is starting!-->ratio is-->"
-                      + ratio + "**_ratio is-->" + _ratio);
-              step = 5;
+              if (makeSure<10) {
+                makeSure++;
+              }else {
+                nextDay = false;
+                LOG.info("jiang-->process END_RATIO is over,shift handle is over!-->ratio is-->"
+                        + ratio + "**_ratio is-->" + _ratio);
+                step = 5;
+              }
             }else {
               ratio = _ratio;
+              makeSure = 0;
             }
             ratioCount = 0;
             ratioSumCount = 0;
