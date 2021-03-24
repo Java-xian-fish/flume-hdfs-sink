@@ -896,6 +896,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 resetData();
                 bucketWriter.setShiftDate(true);
                 normalBucket.offer(bucketWriter);
+                sfWriters.remove(lookupPath);
                 bucketWriter = null;
                 rear = 0;
                 front = 0;
