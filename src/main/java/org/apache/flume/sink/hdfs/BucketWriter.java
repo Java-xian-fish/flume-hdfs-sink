@@ -253,9 +253,9 @@ class BucketWriter {
         fullFileName += codeC.getDefaultExtension();
       }
 
-      bucketPath = filePath + "/" + _day + "/" + inUsePrefix
+      bucketPath = filePath + "/" + _day + "_" + inUsePrefix
               + fullFileName + inUseSuffix;
-      targetPath = filePath + "/" + _day + "/" + fullFileName;
+      targetPath = filePath + "/" + _day + "_" + fullFileName;
 
       LOG.info("jiang-->Creating " + bucketPath);
       callWithTimeout(new CallRunner<Void>() {

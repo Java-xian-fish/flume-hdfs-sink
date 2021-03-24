@@ -612,7 +612,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 step = 3;
               }
             }else if (ratio>LAST_RATIO&& _ratio<LAST_RATIO&&step==3) {
-              if (parallelSinks[15].shiftDate) {
+              if (parallelSinks[15].shiftDate && makeSure > 10) {
                 for (int i=15;i<20;i++){
                   parallelSinks[i].shifting = true;
                 }
@@ -621,6 +621,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 ratio = _ratio > END_RATIO ? _ratio : 0.09;
                 step = 4;
               }
+              makeSure++;
             }else if (ratio>END_RATIO&&_ratio<END_RATIO&&step==4) {
               if (makeSure<10) {
                 makeSure++;
@@ -849,6 +850,19 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
       data = _data;
     }
 
+    public BucketWriter getNormalBucket(String lookupPath){
+      BucketWriter bucketWriter = null;
+      if (!normalBucket.isEmpty()){
+        synchronized (normal) {
+          bucketWriter = normalBucket.poll();
+          sfWriters.put(lookupPath, bucketWriter);
+          bucketWriter.setShiftDate(shiftDate);
+        }
+        LOG.info("jiang-->run thread-->" + id + "**has handle old bucketWriter!" + bucketWriter.getBucketPath());
+      }
+      return bucketWriter;
+    }
+
     @Override
     public void run() {
       int wrong = 0;
@@ -902,14 +916,7 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
                 updateShiftDate = true;
               }
               if (bucketWriter == null) {
-                if (!normalBucket.isEmpty()){
-                  synchronized (normal) {
-                    bucketWriter = normalBucket.poll();
-                    sfWriters.put(lookupPath, bucketWriter);
-                    bucketWriter.setShiftDate(shiftDate);
-                  }
-                  LOG.info("jiang-->run thread-->" + id + "**has handle old bucketWriter!" + bucketWriter.getBucketPath());
-                }
+                bucketWriter = getNormalBucket(lookupPath);
               }
             }
             // we haven't seen this file yet, so open it and cache the handle
@@ -943,10 +950,15 @@ public class HDFSEventSink extends AbstractSink implements Configurable, BatchSi
             } catch (BucketClosedException ex) {
               LOG.info("Thread" + this.id + " Bucket was closed while trying to append, " +
                       "reinitializing bucket and writing event.");
+              if (bucketWriter == null || bucketWriter.closed.get()) {
+                bucketWriter = getNormalBucket(lookupPath);
+              }
               hdfsWriter = writerFactory.getWriter(fileType);
-              bucketWriter = initializeBucketWriter(realPath, realName,
-                      lookupPath, hdfsWriter, closeCallback, id);
-              bucketWriter.setShiftDate(shiftDate);
+              if (bucketWriter == null) {
+                bucketWriter = initializeBucketWriter(realPath, realName,
+                        lookupPath, hdfsWriter, closeCallback, id);
+                bucketWriter.setShiftDate(shiftDate);
+              }
               synchronized (sfWritersLock) {
                 sfWriters.put(lookupPath, bucketWriter);
               }
